@@ -75,11 +75,7 @@ def _load_private_key():
                 return loader(data, password=None)
             except Exception as e:
                 errors.append(f"{loader.__name__}: {type(e).__name__}")
-    raise ValueError(
-        "Kalshi private key could not be parsed (tried PEM and DER across all supported forms). "
-        "Prefer KALSHI_PRIVATE_KEY_B64 containing base64 of the complete unencrypted key file. "
-        "Attempts: " + ", ".join(dict.fromkeys(errors))
-    )
+    raise ValueError("Kalshi private key could not be parsed. Prefer KALSHI_PRIVATE_KEY_B64. Attempts: " + ", ".join(dict.fromkeys(errors)))
 
 class KalshiClient:
     def __init__(self):
@@ -92,7 +88,7 @@ class KalshiClient:
         self.key_id = os.getenv("KALSHI_API_KEY_ID", "").strip() or os.getenv("KALSHI_KEY_ID", "").strip()
         self.subaccount = int(os.getenv("KALSHI_SUBACCOUNT", "0"))
         self.private_key = _load_private_key() if self.key_id else None
-        self.http = httpx.AsyncClient(http2=True, timeout=httpx.Timeout(2.5, connect=1.5))
+        self.http = httpx.AsyncClient(http2=True, timeout=httpx.Timeout(3.0, connect=1.5))
 
     @property
     def configured(self) -> bool:
@@ -102,32 +98,17 @@ class KalshiClient:
         if not self.private_key:
             raise KalshiError("Kalshi private key is not configured")
         msg = f"{timestamp_ms}{method.upper()}{path.split('?')[0]}".encode()
-        sig = self.private_key.sign(
-            msg,
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
-            hashes.SHA256(),
-        )
+        sig = self.private_key.sign(msg, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
         return base64.b64encode(sig).decode()
 
     def headers(self, method: str, path: str) -> dict:
         ts = str(int(time.time() * 1000))
-        return {
-            "KALSHI-ACCESS-KEY": self.key_id,
-            "KALSHI-ACCESS-SIGNATURE": self._signature(ts, method, path),
-            "KALSHI-ACCESS-TIMESTAMP": ts,
-            "Content-Type": "application/json",
-        }
+        return {"KALSHI-ACCESS-KEY": self.key_id, "KALSHI-ACCESS-SIGNATURE": self._signature(ts, method, path), "KALSHI-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
 
     async def request(self, method: str, path: str, *, params=None, json_body=None) -> dict:
         if not self.configured:
             raise KalshiError("Kalshi credentials are not configured")
-        r = await self.http.request(
-            method,
-            self.rest_base + path,
-            params=params,
-            json=json_body,
-            headers=self.headers(method, "/trade-api/v2" + path),
-        )
+        r = await self.http.request(method, self.rest_base + path, params=params, json=json_body, headers=self.headers(method, "/trade-api/v2" + path))
         if r.status_code >= 400:
             raise KalshiError(f"Kalshi {r.status_code}: {r.text[:500]}")
         return r.json()
@@ -147,30 +128,75 @@ class KalshiClient:
                 break
         return positions
 
-    async def create_reduce_ioc(self, ticker: str, position: Decimal, held_floor: Decimal) -> dict:
-        count = abs(position)
-        if count <= 0:
-            raise KalshiError("No position to reduce")
-        if position > 0:
-            side, yes_price = "ask", held_floor
-        else:
-            side, yes_price = "bid", Decimal("1") - held_floor
-        yes_price = min(Decimal("0.9999"), max(Decimal("0.0001"), yes_price))
-        payload = {
+    async def get_market(self, ticker: str) -> dict:
+        data = await self.request("GET", f"/markets/{ticker}")
+        m = data.get("market") or {}
+        return {
             "ticker": ticker,
-            "client_order_id": str(uuid.uuid4()),
-            "side": side,
-            "count": f"{count:.2f}",
-            "price": f"{yes_price:.4f}",
-            "time_in_force": "immediate_or_cancel",
-            "self_trade_prevention_type": "maker",
-            "post_only": False,
-            "cancel_order_on_pause": True,
-            "reduce_only": True,
-            "subaccount": self.subaccount,
-            "exchange_index": -1,
+            "title": m.get("title") or ticker,
+            "subtitle": m.get("subtitle") or "",
+            "yes_label": m.get("yes_sub_title") or "YES",
+            "no_label": m.get("no_sub_title") or "NO",
+            "event_ticker": m.get("event_ticker") or "",
+            "status": m.get("status") or "",
+        }
+
+    async def get_fills(self, ticker: str, max_pages: int = 10) -> list[dict]:
+        fills: list[dict] = []
+        cursor: Optional[str] = None
+        for _ in range(max_pages):
+            params = {"ticker": ticker, "limit": 1000, "subaccount": self.subaccount}
+            if cursor:
+                params["cursor"] = cursor
+            data = await self.request("GET", "/portfolio/fills", params=params)
+            fills.extend(data.get("fills") or [])
+            cursor = data.get("cursor") or None
+            if not cursor:
+                break
+        fills.sort(key=lambda f: int(f.get("ts") or 0))
+        return fills
+
+    async def create_entry_ioc(self, ticker: str, direction: str, count: Decimal, max_held_price: Decimal) -> dict:
+        if count <= 0:
+            raise KalshiError("Entry count must be positive")
+        max_held_price = min(Decimal("0.9999"), max(Decimal("0.0001"), max_held_price))
+        if direction == "yes":
+            side, yes_price = "bid", max_held_price
+        elif direction == "no":
+            side, yes_price = "ask", Decimal("1") - max_held_price
+        else:
+            raise KalshiError("Direction must be yes or no")
+        payload = {
+            "ticker": ticker, "client_order_id": str(uuid.uuid4()), "side": side,
+            "count": f"{count:.2f}", "price": f"{yes_price:.4f}",
+            "time_in_force": "immediate_or_cancel", "self_trade_prevention_type": "maker",
+            "post_only": False, "cancel_order_on_pause": True, "reduce_only": False,
+            "subaccount": self.subaccount, "exchange_index": -1,
         }
         return await self.request("POST", "/portfolio/events/orders", json_body=payload)
+
+    async def create_reduce_ioc_count(self, ticker: str, direction: str, count: Decimal, held_floor: Decimal) -> dict:
+        if count <= 0:
+            raise KalshiError("No quantity to reduce")
+        held_floor = min(Decimal("0.9999"), max(Decimal("0.0001"), held_floor))
+        if direction == "yes":
+            side, yes_price = "ask", held_floor
+        elif direction == "no":
+            side, yes_price = "bid", Decimal("1") - held_floor
+        else:
+            raise KalshiError("Direction must be yes or no")
+        yes_price = min(Decimal("0.9999"), max(Decimal("0.0001"), yes_price))
+        payload = {
+            "ticker": ticker, "client_order_id": str(uuid.uuid4()), "side": side,
+            "count": f"{count:.2f}", "price": f"{yes_price:.4f}",
+            "time_in_force": "immediate_or_cancel", "self_trade_prevention_type": "maker",
+            "post_only": False, "cancel_order_on_pause": True, "reduce_only": True,
+            "subaccount": self.subaccount, "exchange_index": -1,
+        }
+        return await self.request("POST", "/portfolio/events/orders", json_body=payload)
+
+    async def create_reduce_ioc(self, ticker: str, position: Decimal, held_floor: Decimal) -> dict:
+        return await self.create_reduce_ioc_count(ticker, "yes" if position > 0 else "no", abs(position), held_floor)
 
     async def ws_loop(self, on_message: Callable[[dict, Callable[[str], Awaitable[None]]], Awaitable[None]], initial_markets: Callable[[], list[str]], on_connected: Callable[[bool], Awaitable[None]]) -> None:
         if not self.configured:
@@ -186,7 +212,6 @@ class KalshiClient:
                     next_id = 1
                     subscribed_markets: set[str] = set()
                     send_lock = asyncio.Lock()
-
                     async def subscribe_market(ticker: str) -> None:
                         nonlocal next_id
                         if not ticker or ticker in subscribed_markets:
@@ -197,7 +222,6 @@ class KalshiClient:
                             await ws.send(json.dumps({"id": next_id, "cmd": "subscribe", "params": {"channels": ["orderbook_delta"], "market_ticker": ticker}}))
                             next_id += 1
                             subscribed_markets.add(ticker)
-
                     async with send_lock:
                         await ws.send(json.dumps({"id": next_id, "cmd": "subscribe", "params": {"channels": ["market_positions", "fill"]}}))
                         next_id += 1
