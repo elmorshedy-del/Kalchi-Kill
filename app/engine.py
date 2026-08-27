@@ -85,7 +85,7 @@ class StopEngine:
             self.log("warning", "Kalshi credentials are not configured")
             return
         self.positions = await self.kalshi.get_positions()
-        tickers = set(t for t, p in self.positions.items() if p != 0)
+        tickers = {t for t, p in self.positions.items() if p != 0}
         tickers.update(p.ticker for p in self.store.entry_plans.values() if p.armed)
         for ticker in sorted(tickers):
             await self.ensure_market(ticker)
@@ -112,7 +112,10 @@ class StopEngine:
             try:
                 self.market_meta[ticker] = await self.kalshi.get_market(ticker)
             except Exception as e:
-                self.market_meta[ticker] = {"ticker": ticker, "title": ticker, "subtitle": "", "yes_label": "YES", "no_label": "NO", "status": ""}
+                self.market_meta[ticker] = {
+                    "ticker": ticker, "title": ticker, "subtitle": "",
+                    "yes_label": "YES", "no_label": "NO", "status": ""
+                }
                 self.log("warning", f"Market name lookup failed: {str(e)[:120]}", ticker)
         return self.market_meta[ticker]
 
@@ -121,7 +124,39 @@ class StopEngine:
         self.market_meta.pop(ticker, None)
         return await self.ensure_market(ticker)
 
-    async def _load_cost_basis(self, ticker: str, actual_position: Decimal) -> None:
+    @staticmethod
+    def _fill_terms(fill: dict) -> tuple[Decimal, Decimal]:
+        side = (fill.get("side") or fill.get("outcome_side") or fill.get("purchased_side") or "").lower()
+        action = (fill.get("action") or "").lower()
+        count = Decimal(str(fill.get("count_fp") or fill.get("count") or "0"))
+        if count <= 0 or side not in {"yes", "no"} or action not in {"buy", "sell"}:
+            return Decimal("0"), Decimal("0")
+        yes_price = Decimal(str(fill.get("yes_price_dollars") or fill.get("yes_price") or "0"))
+        no_raw = fill.get("no_price_dollars") or fill.get("no_price")
+        no_price = Decimal(str(no_raw)) if no_raw is not None else Decimal("1") - yes_price
+        if side == "yes":
+            return (count if action == "buy" else -count), yes_price
+        return (-count if action == "buy" else count), no_price
+
+    @classmethod
+    def _basis_after_fill(cls, q: Decimal, avg: Optional[Decimal], fill: dict) -> tuple[Decimal, Optional[Decimal]]:
+        delta, held_price = cls._fill_terms(fill)
+        if delta == 0:
+            return q, avg
+        if q == 0:
+            return delta, held_price
+        if q * delta > 0:
+            new_q = q + delta
+            new_avg = ((avg if avg is not None else held_price) * abs(q) + held_price * abs(delta)) / abs(new_q)
+            return new_q, new_avg
+        new_q = q + delta
+        if new_q == 0:
+            return Decimal("0"), None
+        if q * new_q > 0:
+            return new_q, avg
+        return new_q, held_price
+
+    async def _load_cost_basis(self, ticker: str, actual_position: Decimal) -> bool:
         try:
             fills = await self.kalshi.get_fills(ticker)
             q = Decimal("0")
@@ -130,39 +165,46 @@ class StopEngine:
                 q, avg = self._basis_after_fill(q, avg, f)
             if avg is not None and q == actual_position:
                 self.cost_basis[ticker] = avg
-            else:
-                self.cost_basis.pop(ticker, None)
+                return True
+            self.cost_basis.pop(ticker, None)
         except Exception as e:
             self.cost_basis.pop(ticker, None)
             self.log("warning", f"Cost basis unavailable: {str(e)[:120]}", ticker)
+        return False
 
-    @staticmethod
-    def _basis_after_fill(q: Decimal, avg: Optional[Decimal], fill: dict) -> tuple[Decimal, Optional[Decimal]]:
-        side = (fill.get("side") or fill.get("outcome_side") or "").lower()
-        action = (fill.get("action") or "").lower()
-        count = Decimal(str(fill.get("count_fp") or fill.get("count") or "0"))
-        if count <= 0 or side not in {"yes", "no"} or action not in {"buy", "sell"}:
-            return q, avg
-        yes_price = Decimal(str(fill.get("yes_price_dollars") or fill.get("yes_price") or "0"))
-        no_price = Decimal(str(fill.get("no_price_dollars") or fill.get("no_price") or (Decimal("1") - yes_price)))
-        if side == "yes":
-            delta = count if action == "buy" else -count
-            held_price = yes_price
+    async def _refresh_basis_after_fill(self, ticker: str):
+        for delay in (0.25, 0.75, 2.0, 5.0):
+            await asyncio.sleep(delay)
+            pos = self.positions.get(ticker, Decimal("0"))
+            if pos == 0:
+                self.cost_basis.pop(ticker, None)
+                return
+            if await self._load_cost_basis(ticker, pos):
+                await self.evaluate(ticker)
+                return
+
+    async def _apply_live_fill_basis(self, ticker: str, msg: dict):
+        post_raw = msg.get("post_position_fp")
+        delta, held_price = self._fill_terms(msg)
+        if post_raw is None or delta == 0 or held_price <= 0:
+            asyncio.create_task(self._refresh_basis_after_fill(ticker))
+            return
+        post = Decimal(str(post_raw))
+        pre = post - delta
+        old = self.positions.get(ticker, pre)
+        prior_avg = self.cost_basis.get(ticker)
+        if post == 0:
+            self.cost_basis.pop(ticker, None)
+        elif pre == 0:
+            self.cost_basis[ticker] = held_price
+        elif prior_avg is not None:
+            new_q, new_avg = self._basis_after_fill(pre, prior_avg, msg)
+            if new_q == post and new_avg is not None:
+                self.cost_basis[ticker] = new_avg
         else:
-            delta = -count if action == "buy" else count
-            held_price = no_price
-        if q == 0:
-            return delta, held_price if delta != 0 else None
-        if q * delta > 0:
-            new_q = q + delta
-            new_avg = ((avg or held_price) * abs(q) + held_price * abs(delta)) / abs(new_q)
-            return new_q, new_avg
-        new_q = q + delta
-        if new_q == 0:
-            return Decimal("0"), None
-        if q * new_q > 0:
-            return new_q, avg
-        return new_q, held_price
+            asyncio.create_task(self._refresh_basis_after_fill(ticker))
+        self.positions[ticker] = post
+        await self._handle_position_change(ticker, old, post)
 
     def markets_to_watch(self) -> list[str]:
         markets = {t for t, p in self.positions.items() if p != 0}
@@ -202,19 +244,13 @@ class StopEngine:
         elif typ == "fill":
             ticker = msg.get("market_ticker") or msg.get("ticker")
             if ticker:
-                q = self.positions.get(ticker, Decimal("0"))
                 self.log("fill", f"Fill: {msg.get('action')} {msg.get('count_fp')} {msg.get('side')}", ticker)
                 await subscribe_market(ticker)
-                if q != 0:
-                    asyncio.create_task(self._refresh_basis_later(ticker))
+                await self.ensure_market(ticker)
+                await self._apply_live_fill_basis(ticker, msg)
+                await self.evaluate(ticker)
         elif typ == "error":
             self.log("error", f"WebSocket error: {msg}")
-
-    async def _refresh_basis_later(self, ticker: str):
-        await asyncio.sleep(0.4)
-        pos = self.positions.get(ticker, Decimal("0"))
-        if pos != 0:
-            await self._load_cost_basis(ticker, pos)
 
     async def _handle_position_change(self, ticker: str, old: Decimal, new: Decimal):
         if new == 0:
@@ -271,11 +307,18 @@ class StopEngine:
         pnl, pct = self.position_pnl(ticker)
         return pnl if stop.trigger_mode == "pnl_dollars" else pct
 
-    async def set_stop(self, ticker: str, trigger: Decimal, slippage: Decimal, trigger_mode: str, operator: str, armed: bool):
+    def _entry_metric(self, plan: EntryPlan) -> Optional[Decimal]:
+        if plan.entry_mode == "price":
+            return self.entry_price(plan.ticker, plan.direction)
+        pnl, pct = self.position_pnl(plan.ticker)
+        return pnl if plan.entry_mode == "pnl_dollars" else pct
+
+    async def set_stop(self, ticker: str, trigger: Decimal, slippage: Decimal,
+                       trigger_mode: str, operator: str, armed: bool):
         if trigger_mode not in {"price", "pnl_dollars", "pnl_percent"}:
             raise ValueError("Unknown trigger mode")
         if operator not in {"lte", "gte"}:
-            raise ValueError("Operator must be <= or >=")
+            raise ValueError("Unknown trigger condition")
         if trigger_mode == "price" and not (Decimal("0.0001") <= trigger <= Decimal("0.9999")):
             raise ValueError("Price trigger must be between 0.01¢ and 99.99¢")
         if not (Decimal("0") <= slippage <= Decimal("0.25")):
@@ -284,17 +327,19 @@ class StopEngine:
         direction = None
         if armed:
             if pos == 0:
-                raise ValueError("Cannot arm without an open position")
+                raise ValueError("Cannot arm an exit without an open position")
             if not self.ws_connected:
                 raise ValueError("Cannot arm while Kalshi WebSocket is disconnected")
             direction = "yes" if pos > 0 else "no"
             if trigger_mode != "price" and self.cost_basis.get(ticker) is None:
                 await self._load_cost_basis(ticker, pos)
                 if self.cost_basis.get(ticker) is None:
-                    raise ValueError("P/L cost basis could not be reconstructed for this position")
+                    raise ValueError("P/L is not available yet for this position. Try again after the fill appears.")
         stop = self.store.stops.get(ticker) or StopConfig(ticker, trigger, slippage)
-        stop.trigger, stop.slippage = trigger, slippage
-        stop.trigger_mode, stop.operator = trigger_mode, operator
+        stop.trigger = trigger
+        stop.slippage = slippage
+        stop.trigger_mode = trigger_mode
+        stop.operator = operator
         stop.armed = armed
         stop.direction = direction if armed else stop.direction
         stop.fired = False
@@ -305,36 +350,51 @@ class StopEngine:
             await self.evaluate(ticker)
         return stop
 
-    async def create_entry_plan(self, ticker: str, direction: str, quantity: Decimal, entry_operator: str,
-                                entry_trigger: Decimal, entry_slippage: Decimal, exit_mode: str,
-                                exit_operator: str, exit_trigger: Decimal, exit_slippage: Decimal) -> EntryPlan:
+    async def create_entry_plan(
+        self, ticker: str, direction: str, quantity: Decimal, entry_mode: str,
+        entry_operator: str, entry_trigger: Decimal, entry_slippage: Decimal,
+        exit_mode: str, exit_operator: str, exit_trigger: Decimal, exit_slippage: Decimal
+    ) -> EntryPlan:
         ticker = ticker.strip().upper()
         if direction not in {"yes", "no"}:
             raise ValueError("Entry side must be YES or NO")
         if quantity <= 0:
             raise ValueError("Quantity must be positive")
-        if entry_operator not in {"lte", "gte"} or exit_operator not in {"lte", "gte"}:
-            raise ValueError("Condition must be <= or >=")
-        if not (Decimal("0.0001") <= entry_trigger <= Decimal("0.9999")):
-            raise ValueError("Entry price must be between 0.01¢ and 99.99¢")
+        if entry_mode not in {"price", "pnl_dollars", "pnl_percent"}:
+            raise ValueError("Unknown entry trigger type")
         if exit_mode not in {"price", "pnl_dollars", "pnl_percent"}:
-            raise ValueError("Unknown exit mode")
+            raise ValueError("Unknown exit trigger type")
+        if entry_operator not in {"lte", "gte"} or exit_operator not in {"lte", "gte"}:
+            raise ValueError("Unknown trigger condition")
+        if entry_mode == "price" and not (Decimal("0.0001") <= entry_trigger <= Decimal("0.9999")):
+            raise ValueError("Entry price must be between 0.01¢ and 99.99¢")
         if exit_mode == "price" and not (Decimal("0.0001") <= exit_trigger <= Decimal("0.9999")):
             raise ValueError("Exit price must be between 0.01¢ and 99.99¢")
         if not (Decimal("0") <= entry_slippage <= Decimal("0.25") and Decimal("0") <= exit_slippage <= Decimal("0.25")):
             raise ValueError("Slippage must be between 0¢ and 25¢")
         if not self.ws_connected:
             raise ValueError("Cannot arm an entry while Kalshi WebSocket is disconnected")
+        if entry_mode != "price":
+            pos = self.positions.get(ticker, Decimal("0"))
+            same_side = pos > 0 if direction == "yes" else pos < 0
+            if pos == 0 or not same_side:
+                raise ValueError("P/L entry requires an existing position on the same side")
+            if self.cost_basis.get(ticker) is None:
+                await self._load_cost_basis(ticker, pos)
+                if self.cost_basis.get(ticker) is None:
+                    raise ValueError("P/L is not available yet for the existing position")
         await self.lookup_market(ticker)
         plan = EntryPlan.new(
-            ticker=ticker, direction=direction, quantity=quantity, entry_operator=entry_operator,
-            entry_trigger=entry_trigger, entry_slippage=entry_slippage, exit_mode=exit_mode,
-            exit_operator=exit_operator, exit_trigger=exit_trigger, exit_slippage=exit_slippage,
+            ticker=ticker, direction=direction, quantity=quantity,
+            entry_mode=entry_mode, entry_operator=entry_operator,
+            entry_trigger=entry_trigger, entry_slippage=entry_slippage,
+            exit_mode=exit_mode, exit_operator=exit_operator,
+            exit_trigger=exit_trigger, exit_slippage=exit_slippage,
         )
         await self.store.upsert_plan(plan)
         if self._subscribe_market:
             await self._subscribe_market(ticker)
-        self.log("entry", f"Entry armed: {direction.upper()} {quantity} @ {entry_operator} {entry_trigger * 100:.2f}¢", ticker)
+        self.log("entry", f"Entry armed: {direction.upper()} {quantity} on {entry_mode} {entry_operator} {entry_trigger}", ticker)
         await self.evaluate(ticker)
         return plan
 
@@ -362,7 +422,7 @@ class StopEngine:
             if plan.ticker != ticker or not plan.armed:
                 continue
             if plan.status == "waiting_entry":
-                metric = self.entry_price(ticker, plan.direction)
+                metric = self._entry_metric(plan)
                 if self._condition(metric, plan.entry_operator, plan.entry_trigger):
                     asyncio.create_task(self._fire_entry(plan.plan_id))
             elif plan.status == "waiting_exit" and plan.open_qty > 0:
@@ -427,15 +487,16 @@ class StopEngine:
             plan = self.store.entry_plans.get(plan_id)
             if not plan or not plan.armed or plan.status != "waiting_entry":
                 return
+            metric = self._entry_metric(plan)
+            if not self._condition(metric, plan.entry_operator, plan.entry_trigger):
+                return
             live = self.entry_price(plan.ticker, plan.direction)
-            if not self._condition(live, plan.entry_operator, plan.entry_trigger):
+            if live is None:
                 return
             key = "entry:" + plan_id
             if time.monotonic() - self._last_attempt.get(key, 0) < 0.75:
                 return
             self._last_attempt[key] = time.monotonic()
-            if live is None:
-                return
             max_price = min(Decimal("0.9999"), live + plan.entry_slippage)
             self.log("trigger", f"Entry triggered at {live * 100:.2f}¢; IOC cap {max_price * 100:.2f}¢", plan.ticker)
             if not self.execution_enabled:
@@ -520,12 +581,17 @@ class StopEngine:
             if pos == 0 and not stop:
                 continue
             direction = "yes" if pos > 0 else "no" if pos < 0 else None
-            meta = self.market_meta.get(ticker, {"title": ticker, "subtitle": "", "yes_label": "YES", "no_label": "NO"})
+            meta = self.market_meta.get(ticker, {
+                "title": ticker, "subtitle": "", "yes_label": "YES", "no_label": "NO"
+            })
             held = self.held_bid(ticker)
             pnl, pct = self.position_pnl(ticker)
             rows.append({
-                "ticker": ticker, "market": meta, "position": str(pos),
-                "direction": direction.upper() if direction else "FLAT", "quantity": str(abs(pos)),
+                "ticker": ticker,
+                "market": meta,
+                "position": str(pos),
+                "direction": direction.upper() if direction else "FLAT",
+                "quantity": str(abs(pos)),
                 "held_bid": str(held) if held is not None else None,
                 "avg_entry": str(self.cost_basis[ticker]) if ticker in self.cost_basis else None,
                 "pnl_dollars": str(pnl) if pnl is not None else None,
@@ -535,17 +601,28 @@ class StopEngine:
             })
         plans = []
         for plan in sorted(self.store.entry_plans.values(), key=lambda p: p.created_at, reverse=True):
-            meta = self.market_meta.get(plan.ticker, {"title": plan.ticker, "subtitle": "", "yes_label": "YES", "no_label": "NO"})
+            meta = self.market_meta.get(plan.ticker, {
+                "title": plan.ticker, "subtitle": "", "yes_label": "YES", "no_label": "NO"
+            })
             live_entry = self.entry_price(plan.ticker, plan.direction)
+            entry_metric = self._entry_metric(plan) if plan.status == "waiting_entry" else None
             held = self.held_bid(plan.ticker, plan.direction)
             exit_metric = self._linked_exit_metric(plan) if plan.status == "waiting_exit" else None
             d = plan.json_dict()
-            d.update({"market": meta, "live_entry_price": str(live_entry) if live_entry is not None else None,
-                      "held_bid": str(held) if held is not None else None,
-                      "exit_metric": str(exit_metric) if exit_metric is not None else None})
+            d.update({
+                "market": meta,
+                "live_entry_price": str(live_entry) if live_entry is not None else None,
+                "entry_metric": str(entry_metric) if entry_metric is not None else None,
+                "held_bid": str(held) if held is not None else None,
+                "exit_metric": str(exit_metric) if exit_metric is not None else None,
+            })
             plans.append(d)
         return {
-            "ws_connected": self.ws_connected, "execution_enabled": self.execution_enabled,
-            "kalshi_configured": self.kalshi.configured, "environment": self.kalshi.env,
-            "positions": rows, "entry_plans": plans, "events": list(self.events)[:60],
+            "ws_connected": self.ws_connected,
+            "execution_enabled": self.execution_enabled,
+            "kalshi_configured": self.kalshi.configured,
+            "environment": self.kalshi.env,
+            "positions": rows,
+            "entry_plans": plans,
+            "events": list(self.events)[:60],
         }
