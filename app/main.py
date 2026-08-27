@@ -8,12 +8,13 @@ import secrets
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .engine import StopEngine
+from .engine_v2 import StopEngine
 from .kalshi import KalshiClient
 from .store import StopStore
 
@@ -132,8 +133,10 @@ class EntryBody(BaseModel):
     ticker: str
     direction: str
     quantity: Decimal = Field(gt=Decimal("0"))
+    entry_mode: str = "price"
     entry_operator: str = "lte"
-    entry_trigger_cents: Decimal = Field(gt=Decimal("0"), lt=Decimal("100"))
+    entry_trigger_value: Optional[Decimal] = None
+    entry_trigger_cents: Optional[Decimal] = None  # backwards compatibility
     entry_slippage_cents: Decimal = Field(ge=Decimal("0"), le=Decimal("25"))
     exit_mode: str = "price"
     exit_operator: str = "gte"
@@ -142,11 +145,15 @@ class EntryBody(BaseModel):
 
 @app.post("/api/entries", dependencies=[Depends(require_auth)])
 async def create_entry(body: EntryBody):
+    raw_entry = body.entry_trigger_value if body.entry_trigger_value is not None else body.entry_trigger_cents
+    if raw_entry is None:
+        raise HTTPException(status_code=400, detail="Entry trigger value is required")
+    entry_trigger = raw_entry / Decimal("100") if body.entry_mode == "price" else raw_entry
     exit_trigger = body.exit_trigger_value / Decimal("100") if body.exit_mode == "price" else body.exit_trigger_value
     try:
         plan = await engine.create_entry_plan(
-            body.ticker, body.direction.lower(), body.quantity, body.entry_operator,
-            body.entry_trigger_cents / Decimal("100"), body.entry_slippage_cents / Decimal("100"),
+            body.ticker, body.direction.lower(), body.quantity, body.entry_mode, body.entry_operator,
+            entry_trigger, body.entry_slippage_cents / Decimal("100"),
             body.exit_mode, body.exit_operator, exit_trigger, body.exit_slippage_cents / Decimal("100")
         )
         return plan.json_dict()
