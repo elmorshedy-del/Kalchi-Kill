@@ -12,6 +12,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .engine_v2 import StopEngine
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI):
     await kalshi.close()
 
 app = FastAPI(title="Kalchi Kill", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -136,7 +138,7 @@ class EntryBody(BaseModel):
     entry_mode: str = "price"
     entry_operator: str = "lte"
     entry_trigger_value: Optional[Decimal] = None
-    entry_trigger_cents: Optional[Decimal] = None  # backwards compatibility
+    entry_trigger_cents: Optional[Decimal] = None
     entry_slippage_cents: Decimal = Field(ge=Decimal("0"), le=Decimal("25"))
     exit_mode: str = "price"
     exit_operator: str = "gte"
