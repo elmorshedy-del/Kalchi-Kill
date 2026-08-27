@@ -46,6 +46,16 @@ def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
 
+async def runtime_probe():
+    await asyncio.sleep(2)
+    open_positions = sum(1 for p in engine.positions.values() if p != 0)
+    print(
+        f"KALSHI_RUNTIME configured={kalshi.configured} ws_connected={engine.ws_connected} "
+        f"environment={kalshi.env} execution_enabled={EXECUTION_ENABLED} open_positions={open_positions}",
+        flush=True,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ws_task
@@ -54,7 +64,9 @@ async def lifespan(app: FastAPI):
         await engine.bootstrap()
     except Exception as e:
         engine.log("error", f"Startup position sync failed: {e}")
+        print(f"KALSHI_STARTUP_ERROR {type(e).__name__}: {str(e)[:300]}", flush=True)
     ws_task = asyncio.create_task(kalshi.ws_loop(engine.on_ws_message, engine.markets_to_watch, engine.on_connected))
+    asyncio.create_task(runtime_probe())
     yield
     if ws_task:
         ws_task.cancel()
