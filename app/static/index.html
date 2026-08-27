@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Kalshi Stop</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b0e11;--panel:#14181d;--muted:#88929d;--text:#f4f7fa;--line:#29313a;--good:#2bd576;--bad:#ff5b67;--warn:#ffbf47}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .wrap{max-width:980px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:4px 0 18px}
+    h1{font-size:22px;margin:0}.status{display:flex;gap:8px;flex-wrap:wrap}.pill{border:1px solid var(--line);padding:6px 9px;border-radius:999px;font-size:12px;color:var(--muted)}
+    .ok{color:var(--good)}.bad{color:var(--bad)}.warn{color:var(--warn)}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;margin:12px 0;padding:15px}
+    .rowhead{display:flex;justify-content:space-between;gap:12px}.ticker{font-weight:750;overflow-wrap:anywhere}.side{font-size:13px;color:var(--muted)}
+    .price{font-size:31px;font-weight:800;margin:12px 0 2px}.label{font-size:12px;color:var(--muted)}
+    .controls{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-top:14px;align-items:end} label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
+    input{width:100%;background:#0e1216;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:11px;font-size:16px}
+    button{border:0;border-radius:9px;padding:11px 15px;font-weight:750;cursor:pointer;background:#e7edf3;color:#0b0e11}.armed{background:var(--bad);color:white}.disarm{background:#2a323b;color:white}
+    .error{margin-top:8px;color:var(--bad);font-size:13px}.empty{text-align:center;color:var(--muted);padding:35px 10px}.events{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--muted);max-height:220px;overflow:auto}
+    .event{padding:6px 0;border-bottom:1px solid #20262d}.login{max-width:380px;margin:18vh auto}.login input{margin:12px 0}.login button{width:100%}
+    .banner{padding:10px 12px;border-radius:9px;background:#302510;color:#ffd37d;font-size:13px;margin-bottom:12px}
+    @media(max-width:650px){.controls{grid-template-columns:1fr 1fr}.controls button{grid-column:1/-1}.price{font-size:28px}.wrap{padding:12px}}
+  </style>
+</head>
+<body>
+<div class="wrap" id="app"><div class="login"><h1>Kalshi Stop</h1><input id="pw" type="password" placeholder="Dashboard password" autocomplete="current-password"><button onclick="login()">Sign in</button><div id="loginerr" class="error"></div></div></div>
+<script>
+const app=document.getElementById('app'); let timer=null;
+const cents=v=>v==null?'—':(Number(v)*100).toFixed(1)+'¢';
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});if(r.status===401)throw new Error('AUTH');const x=await r.json().catch(()=>({}));if(!r.ok)throw new Error(x.detail||'Request failed');return x}
+async function login(){try{await api('/api/login',{method:'POST',body:JSON.stringify({password:document.getElementById('pw').value})});await refresh();start()}catch(e){document.getElementById('loginerr').textContent=e.message==='AUTH'?'Wrong password':e.message}}
+function start(){if(timer)clearInterval(timer);timer=setInterval(refresh,500)}
+async function save(ticker,armed){const trigger=document.getElementById('t-'+CSS.escape(ticker)).value;const slip=document.getElementById('s-'+CSS.escape(ticker)).value;try{await api('/api/stops/'+encodeURIComponent(ticker),{method:'PUT',body:JSON.stringify({trigger_cents:trigger,slippage_cents:slip,armed})});await refresh()}catch(e){alert(e.message)}}
+function render(s){
+ const conn=s.ws_connected?'<span class="pill ok">● Live feed</span>':'<span class="pill bad">● Feed offline</span>';
+ const exec=s.execution_enabled?'<span class="pill ok">LIVE EXECUTION</span>':'<span class="pill warn">SIMULATION</span>';
+ const cfg=s.kalshi_configured?'':'<span class="pill bad">Credentials missing</span>';
+ let html=`<div class="top"><h1>Kalshi Stop</h1><div class="status">${conn}${exec}<span class="pill">${esc(s.environment).toUpperCase()}</span>${cfg}</div></div>`;
+ if(!s.execution_enabled) html+=`<div class="banner">Execution is disabled. Stops can be tested, but no real exit order will be submitted until EXECUTION_ENABLED=true.</div>`;
+ const open=s.positions.filter(p=>Number(p.position)!==0 || p.stop);
+ if(!open.length) html+='<div class="card empty">No open Kalshi positions detected.</div>';
+ for(const p of open){
+   const st=p.stop||{}; const armed=!!st.armed; const trigger=st.trigger!=null?(Number(st.trigger)*100).toFixed(1):''; const slip=st.slippage!=null?(Number(st.slippage)*100).toFixed(1):'3.0';
+   html+=`<div class="card"><div class="rowhead"><div><div class="ticker">${esc(p.ticker)}</div><div class="side">${esc(p.direction)} · ${esc(p.quantity)} contracts</div></div><div class="side">${armed?'<span class="bad">ARMED</span>':'DISARMED'}</div></div>
+   <div class="price">${cents(p.held_bid)}</div><div class="label">Executable ${esc(p.direction)} bid</div>
+   <div class="controls"><div><label>Stop trigger (¢)</label><input id="t-${esc(p.ticker)}" type="number" min="0.01" max="99.99" step="0.1" value="${trigger}" placeholder="54.0"></div>
+   <div><label>Max slippage (¢)</label><input id="s-${esc(p.ticker)}" type="number" min="0" max="25" step="0.1" value="${slip}"></div>
+   <button class="${armed?'disarm':'armed'}" onclick="save('${esc(p.ticker)}',${!armed})">${armed?'Disarm':'Arm stop'}</button></div>
+   ${st.last_error?`<div class="error">${esc(st.last_error)}</div>`:''}</div>`;
+ }
+ html+='<div class="card"><div class="label" style="margin-bottom:8px">Execution log</div><div class="events">'+(s.events.length?s.events.map(e=>`<div class="event">${new Date(e.ts*1000).toLocaleTimeString()} ${esc(e.ticker||'')} ${esc(e.message)}</div>`).join(''):'No events yet')+'</div></div>';
+ app.innerHTML=html;
+}
+async function refresh(){try{render(await api('/api/state'))}catch(e){if(e.message==='AUTH'){if(timer)clearInterval(timer);app.innerHTML='<div class="login"><h1>Kalshi Stop</h1><input id="pw" type="password" placeholder="Dashboard password"><button onclick="login()">Sign in</button><div id="loginerr" class="error"></div></div>'}}}
+refresh().then(start).catch(()=>{});
+</script>
+</body>
+</html>
