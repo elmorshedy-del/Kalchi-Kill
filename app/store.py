@@ -15,8 +15,8 @@ class StopConfig:
     ticker: str
     trigger: Decimal
     slippage: Decimal
-    trigger_mode: str = "price"  # price | pnl_dollars | pnl_percent
-    operator: str = "lte"        # lte | gte
+    trigger_mode: str = "price"
+    operator: str = "lte"
     armed: bool = False
     direction: Optional[str] = None
     fired: bool = False
@@ -47,17 +47,18 @@ class StopConfig:
 class EntryPlan:
     plan_id: str
     ticker: str
-    direction: str                   # yes | no
+    direction: str
     quantity: Decimal
-    entry_operator: str              # lte | gte
-    entry_trigger: Decimal           # held-side executable buy price
+    entry_mode: str
+    entry_operator: str
+    entry_trigger: Decimal
     entry_slippage: Decimal
-    exit_mode: str                   # price | pnl_dollars | pnl_percent
-    exit_operator: str               # lte | gte
+    exit_mode: str
+    exit_operator: str
     exit_trigger: Decimal
     exit_slippage: Decimal
     armed: bool = True
-    status: str = "waiting_entry"    # waiting_entry | waiting_exit | completed | canceled
+    status: str = "waiting_entry"
     filled_qty: Decimal = Decimal("0")
     open_qty: Decimal = Decimal("0")
     entry_price: Optional[Decimal] = None
@@ -70,7 +71,10 @@ class EntryPlan:
 
     def json_dict(self) -> dict:
         d = asdict(self)
-        for key in ("quantity", "entry_trigger", "entry_slippage", "exit_trigger", "exit_slippage", "filled_qty", "open_qty", "entry_price"):
+        for key in (
+            "quantity", "entry_trigger", "entry_slippage", "exit_trigger",
+            "exit_slippage", "filled_qty", "open_qty", "entry_price"
+        ):
             value = d.get(key)
             d[key] = None if value is None else str(value)
         return d
@@ -78,15 +82,25 @@ class EntryPlan:
     @classmethod
     def from_dict(cls, d: dict) -> "EntryPlan":
         return cls(
-            plan_id=d["plan_id"], ticker=d["ticker"], direction=d["direction"],
-            quantity=Decimal(str(d["quantity"])), entry_operator=d.get("entry_operator", "lte"),
-            entry_trigger=Decimal(str(d["entry_trigger"])), entry_slippage=Decimal(str(d.get("entry_slippage", "0.03"))),
-            exit_mode=d.get("exit_mode", "price"), exit_operator=d.get("exit_operator", "gte"),
-            exit_trigger=Decimal(str(d["exit_trigger"])), exit_slippage=Decimal(str(d.get("exit_slippage", "0.03"))),
-            armed=bool(d.get("armed", True)), status=d.get("status", "waiting_entry"),
-            filled_qty=Decimal(str(d.get("filled_qty", "0"))), open_qty=Decimal(str(d.get("open_qty", "0"))),
+            plan_id=d["plan_id"],
+            ticker=d["ticker"],
+            direction=d["direction"],
+            quantity=Decimal(str(d["quantity"])),
+            entry_mode=d.get("entry_mode", "price"),
+            entry_operator=d.get("entry_operator", "lte"),
+            entry_trigger=Decimal(str(d["entry_trigger"])),
+            entry_slippage=Decimal(str(d.get("entry_slippage", "0.03"))),
+            exit_mode=d.get("exit_mode", "price"),
+            exit_operator=d.get("exit_operator", "gte"),
+            exit_trigger=Decimal(str(d["exit_trigger"])),
+            exit_slippage=Decimal(str(d.get("exit_slippage", "0.03"))),
+            armed=bool(d.get("armed", True)),
+            status=d.get("status", "waiting_entry"),
+            filled_qty=Decimal(str(d.get("filled_qty", "0"))),
+            open_qty=Decimal(str(d.get("open_qty", "0"))),
             entry_price=Decimal(str(d["entry_price"])) if d.get("entry_price") is not None else None,
-            last_error=d.get("last_error"), created_at=float(d.get("created_at", 0) or 0),
+            last_error=d.get("last_error"),
+            created_at=float(d.get("created_at", 0) or 0),
         )
 
 
