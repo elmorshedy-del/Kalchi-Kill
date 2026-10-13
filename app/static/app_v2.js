@@ -1,7 +1,12 @@
 const app = document.getElementById('app');
 let timer = null;
 let lastState = null;
-let positionLockUntil = 0;
+let refreshing = null;
+let entryPending = false;
+const positionIds = new Map();
+const pendingStops = new Set();
+const pendingCancels = new Set();
+let lookupSequence = 0;
 
 const cents = v => v == null ? '—' : (Number(v) * 100).toFixed(1) + '¢';
 const money = v => v == null ? '—' : (Number(v) >= 0 ? '+' : '') + '$' + Number(v).toFixed(2);
@@ -17,7 +22,7 @@ async function api(path, opts = {}) {
   });
   if (r.status === 401) throw new Error('AUTH');
   const x = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(x.detail || 'Request failed');
+  if (!r.ok) throw new Error(typeof x.detail === 'string' ? x.detail : Array.isArray(x.detail) ? x.detail.map(e => e.loc.at(-1) + ': ' + e.msg).join('; ') : 'Request failed');
   return x;
 }
 
@@ -58,8 +63,10 @@ function ruleOptions(selected = 'price_below', context = 'exit') {
 }
 
 function ruleToBackend(rule, rawValue) {
+  if (String(rawValue ?? '').trim() === '') throw new Error('Enter a trigger value');
   const value = Math.abs(Number(rawValue));
   if (!Number.isFinite(value)) throw new Error('Enter a trigger value');
+  if (rule.startsWith('price_') && (value < 0.01 || value > 99.99)) throw new Error('Price must be between 0.01¢ and 99.99¢');
   if (rule === 'price_below') return {mode:'price', operator:'lte', value};
   if (rule === 'price_above') return {mode:'price', operator:'gte', value};
   if (rule === 'take_profit_dollars') return {mode:'pnl_dollars', operator:'gte', value};
@@ -83,7 +90,7 @@ function ruleDisplayValue(mode, trigger) {
 
 function ruleSentence(rule, rawValue, context = 'exit') {
   const v = Math.abs(Number(rawValue));
-  if (!Number.isFinite(v)) return '';
+  if (String(rawValue ?? '').trim() === '' || !Number.isFinite(v)) return '';
   if (rule === 'price_below') return `${context==='entry'?'Enter':'Exit'} when price is ${v.toFixed(1)}¢ or lower.`;
   if (rule === 'price_above') return `${context==='entry'?'Enter':'Exit'} when price is ${v.toFixed(1)}¢ or higher.`;
   if (rule === 'take_profit_dollars') return `${context==='entry'?'Add to position':'Take profit'} when profit reaches +$${v.toFixed(2)}.`;
@@ -120,6 +127,7 @@ function buildShell() {
     <div id="status" class="status"></div>
   </div>
   <div id="banner"></div>
+  <div id="connectionNotice" role="status" aria-live="polite"></div>
 
   <h2>New entry → linked exit</h2>
   <div class="sectionnote">
@@ -188,12 +196,13 @@ function buildShell() {
           <input id="exitSlip" type="number" min="0" max="25" step="0.1" value="3.0">
         </div>
         <div class="actions">
-          <button class="accent" onclick="createEntry()">Arm entry + linked exit</button>
+          <button id="entrySubmit" class="accent" onclick="createEntry()">Arm entry + linked exit</button>
         </div>
       </div>
       <div id="exitHint" class="hint"></div>
     </div>
-    <div id="entryError" class="error"></div>
+    <div id="entryError" class="error" role="alert"></div>
+    <div id="entryFeedback" class="hint ok" role="status" aria-live="polite"></div>
   </div>
 
   <h2>Armed / linked entries</h2>
@@ -206,15 +215,10 @@ function buildShell() {
   <div class="card"><div id="events" class="events"></div></div>`;
 
   const positions = document.getElementById('positions');
-  positions.addEventListener('pointerdown', e => {
-    if (e.target.closest('input,select,button')) positionLockUntil = Date.now() + 1500;
-  }, true);
-  positions.addEventListener('focusin', () => {
-    positionLockUntil = Number.MAX_SAFE_INTEGER;
-  }, true);
-  positions.addEventListener('focusout', () => {
-    positionLockUntil = Date.now() + 500;
-  }, true);
+  for (const event of ['input', 'change']) positions.addEventListener(event, e => {
+    const card = e.target.closest('[data-ticker]');
+    if (card) { card.dataset.dirty = 'true'; delete card.dataset.localError; }
+  });
 
   updateEntryRuleText();
   updateExitRuleText();
@@ -229,22 +233,32 @@ async function lookupMarket() {
   const t = document.getElementById('entryTicker').value.trim().toUpperCase();
   if (!t) return;
   const el = document.getElementById('marketPreview');
+  const sequence = ++lookupSequence;
+  el.textContent = 'Looking up market…';
   try {
     const m = await api('/api/markets/' + encodeURIComponent(t));
+    if (sequence !== lookupSequence || document.getElementById('entryTicker').value.trim().toUpperCase() !== t) return;
     el.textContent = (m.title || t) + (m.subtitle ? ' — ' + m.subtitle : '') +
       ` · YES: ${m.yes_label || 'YES'} · NO: ${m.no_label || 'NO'}`;
   } catch (e) {
-    el.textContent = e.message;
+    if (sequence === lookupSequence) el.textContent = e.message;
   }
 }
 
 async function createEntry() {
+  if (entryPending) return;
+  entryPending = true;
+  const button = document.getElementById('entrySubmit');
+  button.disabled = true; button.textContent = 'Arming…';
   const g = id => document.getElementById(id).value;
   try {
     document.getElementById('entryError').textContent = '';
+    document.getElementById('entryFeedback').textContent = '';
+    if (!g('entryTicker').trim()) throw new Error('Enter a market ticker');
+    if (!(Number(g('entryQty')) > 0)) throw new Error('Contracts must be greater than zero');
     const er = ruleToBackend(g('entryRule'), g('entryValue'));
     const xr = ruleToBackend(g('exitRule'), g('exitValue'));
-    await api('/api/entries', {
+    const plan = await api('/api/entries', {
       method:'POST',
       body:JSON.stringify({
         ticker:g('entryTicker').trim().toUpperCase(),
@@ -260,19 +274,28 @@ async function createEntry() {
         exit_slippage_cents:g('exitSlip')
       })
     });
+    document.getElementById('entryFeedback').textContent = plan.status === 'waiting_exit' ? 'Entry filled; linked exit armed.' : 'Entry + linked exit armed.';
     await refresh(true);
   } catch (e) {
-    document.getElementById('entryError').textContent = e.message;
+    const error = document.getElementById('entryError');
+    if (error) error.textContent = e.message;
+  } finally {
+    entryPending = false;
+    if (button.isConnected) { button.disabled = false; button.textContent = 'Arm entry + linked exit'; }
   }
 }
 
 async function cancelPlan(id) {
+  if (pendingCancels.has(id)) return;
   if (!confirm('Cancel this trigger? If it already entered, this cancels only its linked exit and leaves the position open.')) return;
+  pendingCancels.add(id);
   try {
     await api('/api/entries/' + encodeURIComponent(id), {method:'DELETE'});
     await refresh(true);
   } catch (e) {
     alert(e.message);
+  } finally {
+    pendingCancels.delete(id);
   }
 }
 
@@ -293,7 +316,7 @@ function positionCard(p, i) {
   const summary = value ? ruleSentence(rule, value, 'exit') : 'Choose an exit rule and value.';
 
   return `<div class="card" id="pos-${i}" data-ticker="${esc(p.ticker)}">
-    <div class="rowhead">
+    <div class="rowhead" data-live="header">
       <div>
         <div class="title">${esc(m.title || p.ticker)}</div>
         <div class="subtitle">${esc(m.subtitle || '')}</div>
@@ -305,16 +328,16 @@ function positionCard(p, i) {
       </div>
     </div>
 
-    <div class="price">${cents(p.held_bid)}</div>
-    <div class="label">Executable exit bid · ${esc(p.quantity)} contracts</div>
+    <div class="price" data-live="price">${cents(p.held_bid)}</div>
+    <div class="label" data-live="quantity">Executable exit bid · ${esc(p.quantity)} contracts</div>
 
-    <div class="stats">
+    <div class="stats" data-live="stats">
       <div class="stat"><span class="label">Avg entry</span><strong>${cents(p.avg_entry)}</strong></div>
       <div class="stat"><span class="label">P/L</span><strong class="${p.pnl_dollars==null?'':Number(p.pnl_dollars)>=0?'ok':'bad'}">${money(p.pnl_dollars)}</strong></div>
       <div class="stat"><span class="label">P/L %</span><strong class="${p.pnl_percent==null?'':Number(p.pnl_percent)>=0?'ok':'bad'}">${pct(p.pnl_percent)}</strong></div>
     </div>
 
-    ${pnlReady ? '' : '<div class="hint warn">P/L basis is not available yet. Price exits still work; P/L exits cannot arm until Avg entry appears.</div>'}
+    <div class="hint warn" data-live="basis">${pnlReady ? '' : 'P/L basis is not available yet. Price exits still work; P/L exits cannot arm until Avg entry appears.'}</div>
 
     <div class="grid">
       <div>
@@ -331,14 +354,14 @@ function positionCard(p, i) {
         <label>Max exit slippage (¢)</label>
         <input class="stopSlip" type="number" min="0" max="25" step="0.1" value="${slip}">
       </div>
-      <div class="actions">
+      <div class="actions" data-live="action">
         <button class="${armed?'secondary':'danger'}" onclick="saveStop(${i},${!armed})">
           ${armed?'Disarm exit':'Arm exit'}
         </button>
       </div>
     </div>
     <div class="hint ruleSummary">${esc(summary)}</div>
-    ${st.last_error ? `<div class="error">${esc(st.last_error)}</div>` : ''}
+    <div class="error" data-live="error">${esc(st.last_error || '')}</div>
   </div>`;
 }
 
@@ -353,22 +376,37 @@ function updatePositionRule(i) {
 async function saveStop(i, armed) {
   const c = document.getElementById('pos-' + i);
   const ticker = c.dataset.ticker;
+  if (pendingStops.has(ticker)) return;
+  pendingStops.add(ticker);
+  const button = c.querySelector('button');
+  button.disabled = true;
+  const draft = () => JSON.stringify(['stopRule','stopValue','stopSlip'].map(cls => c.querySelector('.' + cls).value));
+  const submittedDraft = draft();
+  delete c.dataset.localError;
   try {
-    const r = ruleToBackend(c.querySelector('.stopRule').value, c.querySelector('.stopValue').value);
+    const saved = lastState?.positions.find(p => p.ticker === ticker)?.stop;
+    const r = !armed && saved ? {
+      mode:saved.trigger_mode, operator:saved.operator,
+      value:saved.trigger_mode === 'price' ? Number(saved.trigger) * 100 : Number(saved.trigger)
+    } : ruleToBackend(c.querySelector('.stopRule').value, c.querySelector('.stopValue').value);
     await api('/api/stops/' + encodeURIComponent(ticker), {
       method:'PUT',
       body:JSON.stringify({
         trigger_mode:r.mode,
         operator:r.operator,
         trigger_value:r.value,
-        slippage_cents:c.querySelector('.stopSlip').value,
+        slippage_cents:!armed && saved ? Number(saved.slippage) * 100 : c.querySelector('.stopSlip').value,
         armed
       })
     });
-    positionLockUntil = 0;
+    if (draft() === submittedDraft) delete c.dataset.dirty;
     await refresh(true);
   } catch (e) {
-    alert(e.message);
+    c.dataset.localError = e.message;
+    c.querySelector('[data-live=error]').textContent = e.message;
+  } finally {
+    pendingStops.delete(ticker);
+    if (button.isConnected) button.disabled = false;
   }
 }
 
@@ -423,13 +461,41 @@ function render(s, force = false) {
     s.entry_plans?.length ? s.entry_plans.map(planCard).join('') :
     '<div class="card empty">No entry triggers configured.</div>';
 
-  const focus = document.activeElement;
-  const editingPositions = focus && document.getElementById('positions').contains(focus);
-  if (force || (!editingPositions && Date.now() > positionLockUntil)) {
-    const open = s.positions.filter(p => Number(p.position) !== 0 || p.stop);
-    document.getElementById('positions').innerHTML =
-      open.length ? open.map(positionCard).join('') :
-      '<div class="card empty">No open Kalshi positions detected.</div>';
+  const positions = document.getElementById('positions');
+  const open = s.positions.filter(p => Number(p.position) !== 0 || p.stop);
+  const visible = new Set(open.map(p => p.ticker));
+  for (const card of positions.querySelectorAll('[data-ticker]')) {
+    if (!visible.has(card.dataset.ticker)) card.remove();
+  }
+  if (open.length) {
+    positions.querySelector('.empty')?.remove();
+    for (const p of open) {
+      if (!positionIds.has(p.ticker)) positionIds.set(p.ticker, positionIds.size);
+      const i = positionIds.get(p.ticker);
+      const template = document.createElement('template');
+      template.innerHTML = positionCard(p, i);
+      const fresh = template.content.firstElementChild;
+      const card = document.getElementById('pos-' + i);
+      if (!card) { positions.appendChild(fresh); continue; }
+      for (const node of card.querySelectorAll('[data-live]')) {
+        if (node.dataset.live === 'action' && pendingStops.has(p.ticker)) continue;
+        if (node.dataset.live === 'error' && card.dataset.localError) {
+          node.textContent = card.dataset.localError;
+          continue;
+        }
+        const next = fresh.querySelector('[data-live="' + node.dataset.live + '"]');
+        if (node.innerHTML !== next.innerHTML) node.innerHTML = next.innerHTML;
+      }
+      const editing = card.contains(document.activeElement);
+      if (!card.dataset.dirty && !editing && !pendingStops.has(p.ticker)) {
+        for (const cls of ['stopRule','stopValue','stopSlip']) {
+          card.querySelector('.' + cls).value = fresh.querySelector('.' + cls).value;
+        }
+        updatePositionRule(i);
+      }
+    }
+  } else if (!positions.querySelector('.empty')) {
+    positions.innerHTML = '<div class="card empty">No open Kalshi positions detected.</div>';
   }
 
   document.getElementById('events').innerHTML = s.events.length ?
@@ -437,15 +503,29 @@ function render(s, force = false) {
     'No events yet';
 }
 
-async function refresh(force = false) {
-  try {
-    render(await api('/api/state'), force);
-  } catch (e) {
-    if (e.message === 'AUTH') {
-      if (timer) clearInterval(timer);
-      app.innerHTML = '<div class="login"><h1>Kalchi Kill</h1><input id="pw" type="password" placeholder="Dashboard password"><button onclick="login()">Sign in</button><div id="loginerr" class="error"></div></div>';
-    }
-  }
+function refresh(force = false) {
+  if (refreshing) return refreshing.then(() => force ? refresh(true) : undefined);
+  refreshing = (async () => {
+    try {
+      const s = await api('/api/state');
+      if (!document.getElementById('status')) buildShell();
+      render(s, force);
+      document.getElementById('connectionNotice').textContent = '';
+    } catch (e) {
+      if (e.message === 'AUTH') {
+        if (timer) clearInterval(timer);
+        timer = null;
+        app.innerHTML = '<div class="login"><h1>Kalchi Kill</h1><input id="pw" type="password" placeholder="Dashboard password" autocomplete="current-password"><button onclick="login()">Sign in</button><div id="loginerr" class="error"></div></div>';
+      } else {
+        const notice = document.getElementById('connectionNotice');
+        if (notice) {
+          notice.className = 'banner';
+          notice.textContent = 'Updates interrupted: ' + e.message + '. Displayed prices may be stale; reconnecting…';
+        }
+      }
+    } finally { refreshing = null; }
+  })();
+  return refreshing;
 }
 
 refresh(true).then(() => {

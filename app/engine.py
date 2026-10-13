@@ -99,9 +99,12 @@ class StopEngine:
                 stop.last_error = "Disarmed on startup: position is zero"
                 dirty = True
         for plan in self.store.entry_plans.values():
-            if plan.status == "waiting_exit" and plan.open_qty <= 0:
+            pos = self.positions.get(plan.ticker, Decimal("0"))
+            same_side = pos > 0 if plan.direction == "yes" else pos < 0
+            if plan.status == "waiting_exit" and (plan.open_qty <= 0 or not same_side):
                 plan.armed = False
                 plan.status = "completed"
+                plan.open_qty = Decimal("0")
                 dirty = True
         if dirty:
             await self.store.save()
@@ -255,6 +258,20 @@ class StopEngine:
     async def _handle_position_change(self, ticker: str, old: Decimal, new: Decimal):
         if new == 0:
             self.cost_basis.pop(ticker, None)
+        dirty = False
+        for plan in self.store.entry_plans.values():
+            if plan.ticker != ticker or plan.status != "waiting_exit" or not plan.armed:
+                continue
+            same_side = new > 0 if plan.direction == "yes" else new < 0
+            # A just-acknowledged entry can precede its position update. Only an
+            # observed close/flip proves that its linked position is gone.
+            if old != 0 and not same_side:
+                plan.open_qty = Decimal("0")
+                plan.armed = False
+                plan.status = "completed"
+                dirty = True
+        if dirty:
+            await self.store.save()
         stop = self.store.stops.get(ticker)
         if not stop or not stop.armed:
             return
@@ -543,10 +560,8 @@ class StopEngine:
             same_dir_qty = max(Decimal("0"), account_pos if plan.direction == "yes" else -account_pos)
             qty = min(plan.open_qty, same_dir_qty)
             if qty <= 0:
-                plan.armed = False
-                plan.status = "completed"
-                plan.last_error = "Linked quantity is no longer present in account position"
-                await self.store.save()
+                # Order acknowledgements can arrive before position messages.
+                # Keep the linked exit until that position is synchronized.
                 return
             key = "exit:" + plan_id
             if time.monotonic() - self._last_attempt.get(key, 0) < 0.25:
