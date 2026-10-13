@@ -27,7 +27,8 @@ class StopEngine(BaseStopEngine):
             mode, operator = raw.split(":", 1)
             if mode in StopEngine.ENTRY_MODES and operator in {"lte", "gte"}:
                 return mode, operator
-        return "price", raw if raw in {"lte", "gte"} else "lte"
+        mode = plan.entry_mode if plan.entry_mode in StopEngine.ENTRY_MODES else "price"
+        return mode, raw if raw in {"lte", "gte"} else "lte"
 
     @staticmethod
     def _encode_entry_condition(mode: str, operator: str) -> str:
@@ -86,6 +87,7 @@ class StopEngine(BaseStopEngine):
             ticker=ticker,
             direction=direction,
             quantity=quantity,
+            entry_mode=entry_mode,
             entry_operator=encoded_operator,
             entry_trigger=entry_trigger,
             entry_slippage=entry_slippage,
@@ -181,16 +183,10 @@ class StopEngine(BaseStopEngine):
     def state(self) -> dict:
         state = super().state()
         for row in state.get("entry_plans", []):
-            raw = row.get("entry_operator") or "lte"
-            if ":" in raw:
-                mode, operator = raw.split(":", 1)
-                if mode not in self.ENTRY_MODES:
-                    mode, operator = "price", "lte"
-            else:
-                mode, operator = "price", raw
+            plan = self.store.entry_plans[row["plan_id"]]
+            mode, operator = self._decode_entry_condition(plan)
             row["entry_mode"] = mode
             row["entry_operator"] = operator
-            plan = self.store.entry_plans.get(row.get("plan_id"))
             if plan and plan.status == "waiting_entry":
                 metric = self._entry_metric(plan)
                 row["entry_metric"] = str(metric) if metric is not None else None

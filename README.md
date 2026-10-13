@@ -56,3 +56,9 @@ Never put the private key in browser code or commit it to GitHub.
 ## Railway
 
 Mount a persistent volume at `/data`, expose the service, then confirm `/health` reports `ok`, `ws_connected`, and `kalshi_configured` as true before relying on live stops.
+
+## Verification
+
+Run `python -m pip install -r requirements.txt pytest`, then `python -m pytest -q`.
+For dashboard regressions, use Node 22 or newer: `npm ci --prefix tests` and `npm test --prefix tests`.
+The tests use a simulated exchange and never submit real Kalshi orders. They cover authenticated entry/cancel requests, saved trigger modes, partial-fill linked exits, YES/NO order routing, duplicate submission, and keeping edits intact while prices refresh.
